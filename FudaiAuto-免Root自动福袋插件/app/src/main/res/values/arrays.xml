@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="default_comments">
+        <item>我要福袋</item>
+        <item>参与福袋</item>
+        <item>福袋走起</item>
+        <item>支持主播</item>
+        <item>好运福袋</item>
+    </string-array>
+</resources>

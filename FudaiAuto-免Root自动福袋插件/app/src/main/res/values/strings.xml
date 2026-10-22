@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">自动福袋助手</string>
+    <string name="service_desc">自动参与直播间福袋：点击福袋、发表评论参与、发送评论并自动切换下一个直播间。本服务不会收集任何数据。</string>
+</resources>

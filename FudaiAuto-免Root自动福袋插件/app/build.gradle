@@ -11,8 +11,8 @@ android {
         applicationId "com.fudai.auto"
         minSdk 24        // 支持安卓 7.0 及以上
         targetSdk 33     // 保持 33，保证前台服务在 Android 14 上可正常启动
-        versionCode 2
-        versionName "2.0"
+        versionCode 5
+        versionName "5.0"   // v5 = 修复手势权限（canPerformGestures），坐标点击真正生效
     }
 
     buildTypes {

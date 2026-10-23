@@ -15,27 +15,38 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
 
 /**
- * 自动参与直播间福袋的无障碍服务 v2
+ * 自动参与直播间福袋的无障碍服务 v3
  *
- * v2 新增：
- *  1. 盲点模式：直播界面多为自绘控件，读不到文字时改用屏幕坐标点击
- *  2. 前台服务常驻通知：防止被系统杀后台
- *  3. 调试 Toast：每一步在屏幕上提示，方便定位问题
- *  4. 关键词扩充：参与 / 参与抽奖 / 发表评论 等
+ * v3 关键修复：
+ *  1. 【根本问题】服务配置补上 android:canPerformGestures="true"
+ *     没有这一条，dispatchGesture() 会静默失败 —— 表现就是"一直弹坐标但屏幕上毫无反应"
+ *  2. 点击手势时长 60ms → 130ms，并补 lineTo，兼容更多 ROM
+ *  3. 每次 dispatchGesture 都检查返回值与结果回调，失败时明确提示原因
+ *  4. 新增自检（手势能力 / 窗口读取 / 当前前台包名）与"测试点击"功能
+ *  5. 盲点模式不再傻等 12 秒，1.5 秒找不到控件就立刻按坐标点
  */
 class FudaiService : AccessibilityService() {
 
     companion object {
         const val ACTION_START = "com.fudai.auto.START"
         const val ACTION_STOP = "com.fudai.auto.STOP"
+        const val ACTION_SELFTEST = "com.fudai.auto.SELFTEST"
+        const val ACTION_TEST_TAP = "com.fudai.auto.TEST_TAP"
 
         private const val TICK_MS = 1200L
-        private const val STEP_TIMEOUT = 12_000L
+        private const val STEP_TIMEOUT = 9_000L
+        private const val BLIND_DELAY = 1_500L
         private const val SWIPE_DELAY = 2_500L
+        private const val TEST_TAP_DELAY = 3_000L
+
+        private const val TAP_MS = 130L
+        private const val SWIPE_MS = 450L
+
         private const val CHANNEL_ID = "fudai_channel"
 
         private const val STATE_IDLE = 0
@@ -51,13 +62,26 @@ class FudaiService : AccessibilityService() {
     private var commentIndex = 0
     private var failCount = 0
     private var blindJoinTried = false
+    private var blindSendTried = false
     private var lastToast = 0L
+
+    /** 手势注入连续失败次数，用于判断"点击到底有没有生效" */
+    private var gestureFail = 0
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             when (i?.action) {
                 ACTION_START -> start()
                 ACTION_STOP -> stop()
+                ACTION_SELFTEST -> handler.post { selfTest() }
+                ACTION_TEST_TAP -> {
+                    toast("3 秒后按当前坐标点一次，请立刻切到抖音直播间", true)
+                    handler.postDelayed({
+                        val p = getSharedPreferences("cfg", MODE_PRIVATE)
+                        tapPct(p.getFloat("bagX", 10f), p.getFloat("bagY", 12f))
+                        toast("已测试点击福袋位置，看屏幕是否有反应", true)
+                    }, TEST_TAP_DELAY)
+                }
             }
         }
     }
@@ -67,6 +91,8 @@ class FudaiService : AccessibilityService() {
         val filter = IntentFilter().apply {
             addAction(ACTION_START)
             addAction(ACTION_STOP)
+            addAction(ACTION_SELFTEST)
+            addAction(ACTION_TEST_TAP)
         }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -82,19 +108,20 @@ class FudaiService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
     }
 
-    override fun onAccessibilityEvent(event: android.view.accessibility.AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
     private fun start() {
         if (running) return
         running = true
         setState(STATE_IDLE)
+        gestureFail = 0
         getSharedPreferences("cfg", MODE_PRIVATE).edit().putBoolean("running", true).apply()
         try {
             startForeground(1, buildNotification())
         } catch (_: Exception) {
         }
-        toast("自动参与已启动")
+        toast("自动参与已启动", true)
         handler.postDelayed(tick, 500)
     }
 
@@ -104,7 +131,7 @@ class FudaiService : AccessibilityService() {
         getSharedPreferences("cfg", MODE_PRIVATE).edit().putBoolean("running", false).apply()
         handler.removeCallbacks(tick)
         try { stopForeground(true) } catch (_: Exception) {}
-        toast("已停止")
+        toast("已停止", true)
     }
 
     private val tick = object : Runnable {
@@ -114,6 +141,10 @@ class FudaiService : AccessibilityService() {
             handler.postDelayed(this, TICK_MS)
         }
     }
+
+    // ------------------------------------------------------------------
+    //                            主状态机
+    // ------------------------------------------------------------------
 
     private fun step() {
         val p = getSharedPreferences("cfg", MODE_PRIVATE)
@@ -131,69 +162,57 @@ class FudaiService : AccessibilityService() {
 
         when (state) {
 
-            // ---------- 第一步：点击福袋 ----------
+            // ---------- 第一步：点击福袋挂件 ----------
             STATE_IDLE -> {
                 val bag = if (root != null) findBagNode(root) else null
                 if (bag != null) {
                     clickNode(bag)
                     failCount = 0
                     blindJoinTried = false
+                    blindSendTried = false
                     if (debug) toast("① 已点击福袋")
                     setState(STATE_BAG_CLICKED)
-                } else {
-                    failCount++
-                    if (blind && failCount >= 3) {
-                        tapPct(bagX, bagY)
-                        failCount = 0
-                        blindJoinTried = false
-                        if (debug) toast("① 按坐标点击福袋($bagX%,$bagY%)")
-                        setState(STATE_BAG_CLICKED)
-                    } else if (debug && failCount % 8 == 0) {
-                        toast("未发现福袋，请确认坐标或开启盲点模式")
-                    }
+                    return
+                }
+                failCount++
+                if (blind && failCount >= 2) {
+                    tapPct(bagX, bagY)
+                    failCount = 0
+                    blindJoinTried = false
+                    blindSendTried = false
+                    if (debug) toast("① 坐标点击福袋($bagX%,$bagY%)")
+                    setState(STATE_BAG_CLICKED)
+                } else if (debug && failCount % 6 == 0) {
+                    toast("未识别到福袋，将按坐标点击，请确认坐标是否正确")
                 }
             }
 
-            // ---------- 第二步：点击参与 ----------
+            // ---------- 第二步：点击「发表评论后参与」 ----------
             STATE_BAG_CLICKED -> {
-                if (now - stateTime > STEP_TIMEOUT) {
-                    if (blind && !blindJoinTried) {
-                        tapPct(joinX, joinY)
-                        blindJoinTried = true
-                        if (debug) toast("② 按坐标点击参与($joinX%,$joinY%)")
-                        stateTime = now
-                        return
-                    }
-                    if (debug) toast("未找到参与按钮，回到第一步")
-                    blindJoinTried = false
-                    setState(STATE_IDLE)
-                    return
-                }
-                val join = if (root == null) null else
-                    (findByText(root, "发表评论后参与")
-                        ?: findExactClickable(root, "参与")
-                        ?: findByText(root, "参与抽奖")
-                        ?: findByText(root, "发表评论")
-                        ?: findByText(root, "领取"))
+                val join = if (root != null) findJoinNode(root) else null
                 if (join != null) {
                     clickNode(join)
+                    blindSendTried = false
                     if (debug) toast("② 已点击参与")
                     setState(STATE_JOIN_CLICKED)
+                    return
+                }
+                val waited = now - stateTime
+                if (blind && !blindJoinTried && waited > BLIND_DELAY) {
+                    tapPct(joinX, joinY)
+                    blindJoinTried = true
+                    if (debug) toast("② 坐标点击参与($joinX%,$joinY%)")
+                    return
+                }
+                if (waited > STEP_TIMEOUT) {
+                    if (debug) toast("没找到参与按钮，回到第一步")
+                    blindJoinTried = false
+                    setState(STATE_IDLE)
                 }
             }
 
-            // ---------- 第三步：填评论并发送 ----------
+            // ---------- 第三步：填评论并点击发送 ----------
             STATE_JOIN_CLICKED -> {
-                if (now - stateTime > STEP_TIMEOUT) {
-                    if (blind) {
-                        tapPct(sendX, sendY)
-                        if (debug) toast("③ 按坐标点击发送($sendX%,$sendY%)")
-                        setState(STATE_SENT)
-                        return
-                    }
-                    setState(STATE_IDLE)
-                    return
-                }
                 if (root != null) {
                     ensureCommentText(root)
                     val send = findSendButton(root)
@@ -202,7 +221,21 @@ class FudaiService : AccessibilityService() {
                         commentIndex++
                         if (debug) toast("③ 已发送评论")
                         setState(STATE_SENT)
+                        return
                     }
+                }
+                val waited = now - stateTime
+                if (blind && !blindSendTried && waited > BLIND_DELAY) {
+                    tapPct(sendX, sendY)
+                    blindSendTried = true
+                    if (debug) toast("③ 坐标点击发送($sendX%,$sendY%)")
+                    setState(STATE_SENT)
+                    return
+                }
+                if (waited > STEP_TIMEOUT) {
+                    if (debug) toast("没找到发送按钮，回到第一步")
+                    blindSendTried = false
+                    setState(STATE_IDLE)
                 }
             }
 
@@ -211,6 +244,7 @@ class FudaiService : AccessibilityService() {
                 if (now - stateTime > SWIPE_DELAY) {
                     swipeToNextLive()
                     blindJoinTried = false
+                    blindSendTried = false
                     if (debug) toast("④ 上滑，切换下一个直播间")
                     setState(STATE_IDLE)
                 }
@@ -231,7 +265,12 @@ class FudaiService : AccessibilityService() {
         val screenH = resources.displayMetrics.heightPixels
         var fallback: AccessibilityNodeInfo? = null
         for (keyword in arrayOf("福袋", "领取福袋", "开奖")) {
-            for (n in root.findAccessibilityNodeInfosByText(keyword)) {
+            val list = try {
+                root.findAccessibilityNodeInfosByText(keyword)
+            } catch (_: Exception) {
+                emptyList<AccessibilityNodeInfo>()
+            }
+            for (n in list) {
                 if (!n.isVisibleToUser) continue
                 val txt = (n.text ?: n.contentDescription)?.toString() ?: ""
                 if (txt.contains("明细") || txt.contains("规则") || txt.contains("中奖")
@@ -246,22 +285,45 @@ class FudaiService : AccessibilityService() {
         return fallback
     }
 
+    private fun findJoinNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        return findByText(root, "发表评论后参与")
+            ?: findByText(root, "参与抽奖")
+            ?: findByText(root, "发表评论")
+            ?: findExactClickable(root, "参与")
+            ?: findByText(root, "领取")
+    }
+
     private fun findByText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
-        for (n in root.findAccessibilityNodeInfosByText(text)) {
+        val list = try {
+            root.findAccessibilityNodeInfosByText(text)
+        } catch (_: Exception) {
+            emptyList<AccessibilityNodeInfo>()
+        }
+        for (n in list) {
             if (n.isVisibleToUser) return n
         }
         return null
     }
 
     private fun findExactClickable(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
-        for (n in root.findAccessibilityNodeInfosByText(text)) {
+        val list = try {
+            root.findAccessibilityNodeInfosByText(text)
+        } catch (_: Exception) {
+            emptyList<AccessibilityNodeInfo>()
+        }
+        for (n in list) {
             if (n.isVisibleToUser && n.text?.toString() == text) return n
         }
         return null
     }
 
     private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        for (n in root.findAccessibilityNodeInfosByText("发送")) {
+        val list = try {
+            root.findAccessibilityNodeInfosByText("发送")
+        } catch (_: Exception) {
+            emptyList<AccessibilityNodeInfo>()
+        }
+        for (n in list) {
             if (n.isVisibleToUser && n.text?.toString() == "发送") return n
         }
         return null
@@ -275,7 +337,7 @@ class FudaiService : AccessibilityService() {
         var guard = 0
         while (queue.isNotEmpty() && guard < 500) {
             guard++
-            val n = queue.removeFirst() ?: continue
+            val n = queue.removeFirst()
             if (n.className == android.widget.EditText::class.java.name) {
                 val t = n.text?.toString()?.trim()
                 if (t.isNullOrEmpty()) {
@@ -300,14 +362,19 @@ class FudaiService : AccessibilityService() {
     }
 
     // ------------------------------------------------------------------
-    //                       点击 / 滑动 / 提示
+    //                    手势注入（点击 / 滑动）
     // ------------------------------------------------------------------
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
         var n: AccessibilityNodeInfo? = node
         var depth = 0
         while (n != null && depth < 6) {
-            if (n.isClickable && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            if (n.isClickable) {
+                try {
+                    if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                } catch (_: Exception) {
+                }
+            }
             n = n.parent
             depth++
         }
@@ -323,11 +390,14 @@ class FudaiService : AccessibilityService() {
     }
 
     private fun tap(x: Float, y: Float): Boolean {
-        val path = Path().apply { moveTo(x, y) }
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y)
+        }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, TAP_MS))
             .build()
-        return dispatchGesture(gesture, null, null)
+        return dispatch(gesture, "点击")
     }
 
     private fun swipeToNextLive() {
@@ -339,18 +409,140 @@ class FudaiService : AccessibilityService() {
             lineTo(w / 2, h * 0.22f)
         }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 450))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, SWIPE_MS))
             .build()
-        dispatchGesture(gesture, null, null)
+        dispatch(gesture, "上滑")
     }
 
-    private fun toast(msg: String) {
-        val now = System.currentTimeMillis()
-        if (now - lastToast < 700) return
-        lastToast = now
+    /**
+     * 统一的手势发送入口：
+     *  - 返回 false：服务没有手势权限（配置缺 canPerformGestures），必须重装 APK
+     *  - 回调 onCancelled：手势被系统/ROM 拦截
+     */
+    private fun dispatch(gesture: GestureDescription, what: String): Boolean {
+        var started = false
         try {
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            started = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    gestureFail = 0
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    gestureFail++
+                    if (gestureFail == 2 || gestureFail % 6 == 0) {
+                        toast(
+                            "⚠️ ${what}被系统拦截(第 $gestureFail 次)：\n" +
+                                "请检查开发者选项是否开了「禁止模拟点击」，" +
+                                "并在无障碍设置里重新开关一次本服务",
+                            true
+                        )
+                    }
+                }
+            }, null)
         } catch (_: Exception) {
+            started = false
+        }
+        if (!started) {
+            gestureFail++
+            if (gestureFail == 1 || gestureFail % 6 == 0) {
+                toast("⚠️ 无法${what}：本服务未获得手势权限，请安装最新版 APK", true)
+            }
+        }
+        return started
+    }
+
+    // ------------------------------------------------------------------
+    //                            自检
+    // ------------------------------------------------------------------
+
+    private fun selfTest() {
+        val root = rootInActiveWindow
+        val pkg = root?.packageName?.toString() ?: "未知"
+        val count = countNodes(root)
+        toast(
+            "① 窗口读取：" + (if (root != null) "正常 ✅" else "失败 ❌") + "\n" +
+                "   当前前台应用：$pkg\n" +
+                "   可读控件数：$count",
+            true
+        )
+
+        val dm = resources.displayMetrics
+        val path = Path().apply {
+            moveTo(dm.widthPixels / 2f, dm.heightPixels - 4f)
+            lineTo(dm.widthPixels / 2f, dm.heightPixels - 4f)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, TAP_MS))
+            .build()
+
+        var started = false
+        try {
+            started = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    gestureFail = 0
+                    toast("② 模拟点击：可用 ✅ 现在可以正常自动参与了", true)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    toast(
+                        "② 模拟点击：被系统拒绝 ❌\n" +
+                            "请检查开发者选项里的「禁止模拟点击」，" +
+                            "或到无障碍设置里关闭再重新开启本服务",
+                        true
+                    )
+                }
+            }, null)
+        } catch (_: Exception) {
+            started = false
+        }
+        if (!started) {
+            toast(
+                "② 模拟点击：不可用 ❌\n" +
+                    "服务未声明手势权限（canPerformGestures），\n" +
+                    "说明当前安装的是旧版 APK，请安装最新版",
+                true
+            )
+        }
+    }
+
+    private fun countNodes(root: AccessibilityNodeInfo?): Int {
+        if (root == null) return 0
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var count = 0
+        var guard = 0
+        while (queue.isNotEmpty() && guard < 800) {
+            guard++
+            val n = queue.removeFirst()
+            count++
+            for (i in 0 until n.childCount) {
+                val c = try { n.getChild(i) } catch (_: Exception) { null }
+                if (c != null && guard + count < 800) queue.add(c)
+            }
+        }
+        return count
+    }
+
+    // ------------------------------------------------------------------
+    //                          提示 / 通知
+    // ------------------------------------------------------------------
+
+    /** important=true 用于自检等重要提示，不受节流限制且显示更久 */
+    private fun toast(msg: String, important: Boolean = false) {
+        if (!important) {
+            val now = System.currentTimeMillis()
+            if (now - lastToast < 800) return
+            lastToast = now
+        }
+        handler.post {
+            try {
+                Toast.makeText(
+                    this,
+                    msg,
+                    if (important) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+                ).show()
+            } catch (_: Exception) {
+            }
         }
     }
 
